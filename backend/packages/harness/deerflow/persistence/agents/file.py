@@ -19,7 +19,6 @@ import shutil
 import tempfile
 from collections.abc import Hashable
 from pathlib import Path
-from typing import Any
 
 import yaml
 
@@ -44,18 +43,50 @@ logger = logging.getLogger(__name__)
 class FileAgentStore(AgentStore):
     def get(self, name: str, *, user_id: str | None = None) -> AgentConfig:
         name = validate_agent_name(name)
-        agent_dir = resolve_agent_dir(name, user_id=user_id)
-        config_file = agent_dir / "config.yaml"
-        if not agent_dir.exists():
-            raise FileNotFoundError(f"Agent directory not found: {agent_dir}")
-        if not config_file.exists():
-            raise FileNotFoundError(f"Agent config not found: {config_file}")
-        try:
-            with open(config_file, encoding="utf-8") as f:
-                data: dict[str, Any] = yaml.safe_load(f) or {}
-        except yaml.YAMLError as e:
-            raise ValueError(f"Failed to parse agent config {config_file}: {e}") from e
-        return parse_agent_config(data, name)
+        paths = _ac.get_paths()
+        effective_user = user_id or _ac.get_effective_user_id()
+        primary = resolve_agent_dir(name, user_id=user_id)
+        candidates = [
+            primary,
+            paths.user_agent_dir(effective_user, name),
+            paths.agent_dir(name),
+        ]
+        # De-duplicate while preserving the probe order (per-user first).
+        ordered: list[Path] = []
+        seen: set[Path] = set()
+        for candidate in candidates:
+            if candidate not in seen:
+                seen.add(candidate)
+                ordered.append(candidate)
+
+        missing_dir = True
+        last_existing_config: Path | None = None
+        for candidate in ordered:
+            config_file = candidate / "config.yaml"
+            if not candidate.exists():
+                continue
+            missing_dir = False
+            last_existing_config = config_file
+            # A concurrent ``update`` commits via a staged temp file + atomic
+            # ``os.replace``, which unlinks ``config.yaml`` an instant before
+            # linking the new one. Retry the read across that window so a reader
+            # sees the old or new config instead of a spurious
+            # "Agent config not found" — matching the intermittent "fails after
+            # several runs, then recovers" report in #3098.
+            for _ in range(3):
+                try:
+                    with open(config_file, encoding="utf-8") as f:
+                        data = yaml.safe_load(f) or {}
+                    return parse_agent_config(data, name)
+                except FileNotFoundError:
+                    continue
+                except yaml.YAMLError as e:
+                    raise ValueError(f"Failed to parse agent config {config_file}: {e}") from e
+        if missing_dir:
+            raise FileNotFoundError(f"Agent directory not found: {primary}")
+        raise FileNotFoundError(
+            f"Agent config not found: {last_existing_config or primary / 'config.yaml'}"
+        )
 
     def exists(self, name: str, *, user_id: str | None = None) -> bool:
         name = validate_agent_name(name)
